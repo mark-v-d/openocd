@@ -814,8 +814,8 @@ static int xmc4xxx_write_page(struct flash_bank *bank, const uint8_t *pg_buf,
 	return res;
 }
 
-static int xmc4xxx_write(struct flash_bank *bank, const uint8_t *buffer,
-			 uint32_t offset, uint32_t count)
+static int xmc4xxx_write(struct flash_bank *bank, const uint8_t * buffer,
+						 uint32_t offset, uint32_t count)
 {
 	struct xmc4xxx_flash_bank *fb = bank->driver_priv;
 	int res = ERROR_OK;
@@ -837,61 +837,124 @@ static int xmc4xxx_write(struct flash_bank *bank, const uint8_t *buffer,
 		return ERROR_FAIL;
 	}
 
-
-	/* Attempt to write the passed in buffer to flash */
-	/* Pages are written 256 bytes at a time, we need to handle
-	 * scenarios where padding is required at the beginning and
-	 * end of a page */
-	while (count) {
-		/* page working area */
-		uint8_t tmp_buf[256] = {0};
-
-		/* Amount of data we'll be writing to this page */
-		int remaining;
-		int end_pad;
-
-		remaining = MIN(count, sizeof(tmp_buf));
-		end_pad   = sizeof(tmp_buf) - remaining;
-
-		/* Make sure we're starting on a page boundary */
-		int start_pad = offset % 256;
-		if (start_pad) {
-			LOG_INFO("Write does not start on a 256 byte boundary. "
-				 "Padding by %d bytes", start_pad);
-			memset(tmp_buf, 0xff, start_pad);
-			/* Subtract the amount of start offset from
-			 * the amount of data we'll need to write */
-			remaining -= start_pad;
-		}
-
-		/* Remove the amount we'll be writing from the total count */
-		count -= remaining;
-
-		/* Now copy in the remaining data */
-		memcpy(&tmp_buf[start_pad], buffer, remaining);
-
-		if (end_pad) {
-			LOG_INFO("Padding end of page @%08"PRIx32" by %d bytes",
-				 bank->base + offset, end_pad);
-			memset(&tmp_buf[256 - end_pad], 0xff, end_pad);
-		}
-
-		/* Now commit this page to flash, if there was start
-		 * padding, we should subtract that from the target offset */
-		res = xmc4xxx_write_page(bank, tmp_buf, (offset - start_pad), false);
-		if (res != ERROR_OK) {
-			LOG_ERROR("Unable to write flash page");
-			goto abort_write_and_exit;
-		}
-
-		/* Advance the buffer pointer */
-		buffer += remaining;
-
-		/* Advance the offset */
-		offset += remaining;
+	/* flash write code */
+	struct working_area *write_algorithm;
+	static const uint8_t flash_write_code[] = {
+#include "../../../contrib/loaders/flash/xmc4xxx/write.inc"
+	};
+	if (target_alloc_working_area(bank->target, sizeof(flash_write_code),
+								  &write_algorithm) != ERROR_OK) {
+		LOG_WARNING
+			("no working area available, can't do block memory writes");
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+	int retval =
+		target_write_buffer(bank->target, write_algorithm->address,
+							sizeof(flash_write_code), flash_write_code);
+	if (retval != ERROR_OK) {
+		target_free_working_area(bank->target, write_algorithm);
+		return retval;
 	}
 
-abort_write_and_exit:
+	/* memory buffer */
+	struct working_area *source;
+	uint32_t buffer_size = 0x40000;
+	while (target_alloc_working_area_try
+		   (bank->target, buffer_size, &source)
+		   != ERROR_OK) {
+		buffer_size -= 256;
+		buffer_size &= ~3UL;	/* Make sure it's 4 byte aligned */
+		if (buffer_size <= 256) {
+			/* we already allocated the writing code, but failed to get a
+			 * buffer, free the algorithm */
+			target_free_working_area(bank->target, write_algorithm);
+
+			LOG_WARNING("not enough working area available, "
+						"can't do block memory writes");
+			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+		}
+	}
+
+	uint32_t old_count = count;
+	if (offset & 0xff) {
+		LOG_WARNING("Write does not start on a 256 byte boundary. "
+					"Padding by %d bytes", offset & 0xff);
+		count += offset & 0xff;
+	}
+	if (count & 0xff) {
+		LOG_WARNING("Write does not end on a 256 byte boundary. "
+					"Padding by %d bytes", 0x100 - (count & 0xff));
+		count += 0x100;
+		count &= 0xffffff00UL;
+	}
+	uint8_t *aligned = alloca(count);
+	memcpy(aligned + (offset & 0xff), buffer, old_count);
+	offset &= 0xffffff00UL;
+
+	LOG_INFO("Algorithm at 0x%08x", write_algorithm->address);
+
+	struct reg_param reg_params[4];
+	init_reg_param(&reg_params[0], "r0", 32, PARAM_IN_OUT);
+	init_reg_param(&reg_params[1], "r1", 32, PARAM_OUT);
+	init_reg_param(&reg_params[2], "r2", 32, PARAM_OUT);
+	init_reg_param(&reg_params[3], "r3", 32, PARAM_IN_OUT);
+	while (count) {
+		int wsize = MIN(count, buffer_size);	/* bytes written in this iteration */
+		LOG_INFO("Source %d bytes @ 0x%08x, to 0x%08x (%d remaining)",
+				 wsize, source->address, bank->base + offset, count);
+		retval = target_write_buffer(bank->target, source->address,
+									 wsize, aligned);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("Cannot write %d bytes to data buffer\n", wsize);
+			target_free_working_area(bank->target, source);
+			target_free_working_area(bank->target, write_algorithm);
+			xmc4xxx_clear_flash_status(bank);
+			return retval;
+		}
+		buf_set_u32(reg_params[0].value, 0, 32, source->address);
+		buf_set_u32(reg_params[1].value, 0, 32, source->address + wsize);
+		buf_set_u32(reg_params[2].value, 0, 32, bank->base + offset);
+		buf_set_u32(reg_params[3].value, 0, 32, 0);
+
+		struct armv7m_algorithm armv7m_info;
+		armv7m_info.common_magic = ARMV7M_COMMON_MAGIC;
+		armv7m_info.core_mode = ARM_MODE_THREAD;
+
+		retval = target_start_algorithm(bank->target,
+										0, NULL,
+										4, reg_params,
+										write_algorithm->address, 0,
+										&armv7m_info);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("flash write failed at address 0x%" PRIx32,
+					  buf_get_u32(reg_params[0].value, 0, 32));
+		}
+
+		retval = target_wait_algorithm(bank->target,
+									   0, NULL,
+									   4, reg_params,
+									   0, 10000, &armv7m_info);
+		if (retval != ERROR_OK) {
+			LOG_ERROR("Completion failed");
+			target_free_working_area(bank->target, source);
+			target_free_working_area(bank->target, write_algorithm);
+			xmc4xxx_clear_flash_status(bank);
+			return retval;
+		}
+
+		aligned += wsize;
+		offset += wsize;
+		count -= wsize;
+	}
+
+	destroy_reg_param(&reg_params[0]);
+	destroy_reg_param(&reg_params[1]);
+	destroy_reg_param(&reg_params[2]);
+	destroy_reg_param(&reg_params[3]);
+
+
+	target_free_working_area(bank->target, source);
+	target_free_working_area(bank->target, write_algorithm);
 	xmc4xxx_clear_flash_status(bank);
 	return res;
 
